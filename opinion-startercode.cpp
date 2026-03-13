@@ -130,13 +130,18 @@ int main() {
     
     /// (6)  //////////////////////////////////////////////
     // Run until consensus or max iterations
-    while(opinions_changed && iteration < max_iterations)
+    while(iteration < max_iterations)
     {
         opinions_changed = update_opinions();
+        // If no opinions changed this round, break out immediately
+        // so we don't count it as an extra iteration
+        if(!opinions_changed) {
+            break; 
+        }
         iteration++;
         
         // Print the state of the system at regular intervals (e.g., every 10 iterations)
-        if(iteration % 10 == 0 && opinions_changed)
+        if(opinions_changed)
         {
             cout << "Iteration " << iteration << ": fraction of 1's = " 
                  << calculate_fraction_of_ones() << endl;
@@ -146,8 +151,10 @@ int main() {
     ////////////////////////////////////////////////////////
     // Print final result
     double final_fraction = calculate_fraction_of_ones();
-    cout << "Iteration " << iteration << ": fraction of 1's = " 
-         << final_fraction << endl;
+
+    // RM redundant printing of final fraction since we already print it in the loop, but keeping it here for clarity
+    // cout << "Iteration " << iteration << ": fraction of 1's = " 
+    //     << final_fraction << endl;
     
     if(final_fraction == 1.0)
         cout << "Consensus reached: all 1's" << endl;
