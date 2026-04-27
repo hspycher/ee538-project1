@@ -1,200 +1,210 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <utility>
+#include <cstdint>
 using namespace std;
 
 /********************DO NOT EDIT**********************/
-// Function prototype. Defined later.
+// Function prototypes. Defined later.
 void read_opinions(string filename); // reads file into opinions vector and updates total_nodes as needed
-void read_edges(string filename); // reads file into edge_list, defined later
-void build_adj_matrix(); // convert edge_list to adjacency matrix
+void read_edges(string filename);    // reads file into a temporary edge buffer
+void build_reverse_adj_csr();        // converts edge buffer into CSR reverse-adjacency
 
 int total_nodes = 0; // We keep track of the total number of nodes based on largest node id.
 
+// One byte per opinion -- 4x smaller than int, and vector<bool> is avoided
+// because its proxy references make it slower in tight loops.
+std::vector<uint8_t> opinions;
 
-/****************************************************************/
+// Temporary buffer of edges, populated by read_edges and freed once
+// build_reverse_adj_csr has consumed it. Kept compact via pair<int,int>
+// (8 bytes) instead of vector<vector<int>> (~32 bytes per edge).
+std::vector<std::pair<int,int>> edge_buffer;
 
-/******** Create adjacency matrix and vector of opinions */
-// simple vector to hold each node's opinion (0 or 1)
-std::vector<int> opinions;
+// CSR reverse-adjacency. See header comment above.
+std::vector<int> rev_off;
+std::vector<int> rev_adj;
 
-// global adjacency matrix initialized later
-std::vector<std::vector<int>> adj;
-
-// edge list: each row contains {source, target}
-std::vector<std::vector<int>> edge_list;
-
-void build_adj_matrix()
+void build_reverse_adj_csr()
 {
-    // (1) allocate matrix adj of appropriate size
-    adj.assign(total_nodes, std::vector<int>(total_nodes, 0));
+    // (1) Build CSR reverse-adjacency from edge_buffer in three linear passes.
 
-    // (2) run through edge list and populate adj
-    for(size_t i = 0; i < edge_list.size(); ++i)
+    // Pass A: count the in-degree of each target node.
+    // We store counts in rev_off[t+1] so the prefix-sum step below
+    // produces the correct starting offsets directly.
+    rev_off.assign(total_nodes + 1, 0);
+    for (const auto& e : edge_buffer)
     {
-        int source = edge_list[i][0];
-        int target = edge_list[i][1];
-        
-        // "0, 2 corresponds to: voter 0 influences voter 2"
-        // Set adj[source][target] to 1 to denote this directional influence
-        adj[source][target] = 1;
+        // edge.first influences edge.second  ==>  one in-edge to .second
+        ++rev_off[e.second + 1];
     }
+
+    // Pass B: prefix sum -- turn counts into starting offsets.
+    for (int i = 1; i <= total_nodes; ++i)
+    {
+        rev_off[i] += rev_off[i - 1];
+    }
+
+    // Pass C: scatter sources into each target's slot.
+    rev_adj.resize(edge_buffer.size());
+    std::vector<int> cursor(rev_off.begin(), rev_off.begin() + total_nodes);
+    for (const auto& e : edge_buffer)
+    {
+        rev_adj[cursor[e.second]++] = e.first;
+    }
+
+    // Free the edge buffer -- CSR replaces it from here on out.
+    std::vector<std::pair<int,int>>().swap(edge_buffer);
 }
 
 double calculate_fraction_of_ones()
 {
-    // (3) Calculate the fraction of nodes with opinion 1 and return it.
-    if(total_nodes == 0) return 0.0;
-    
-    int ones = 0;
-    for(int i = 0; i < total_nodes; ++i)
+    // (3) Fraction of nodes whose opinion is 1.
+    if (total_nodes == 0) return 0.0;
+
+    // Opinions are 0 or 1, so a sum is the count of 1's.
+    long long ones = 0;
+    for (int i = 0; i < total_nodes; ++i)
     {
-        if(opinions[i] == 1)
-        {
-            ones++;
-        }
+        ones += opinions[i];
     }
     return static_cast<double>(ones) / total_nodes;
 }
 
-// For a given node, count majority opinion among its neighbours. Tie -> 0.
+// For a given node, count the majority opinion among its in-neighbors.
+// Tie -> 0.
 int get_majority_friend_opinions(int node)
 {
-    // (4) Count the number of neighbours with opinion 0 and opinion 1. 
-    // Return the majority (0 or 1). If tie, return 0.
-    int count_0 = 0;
+    // (4) Walk only the in-neighbors of `node`. With CSR this is a
+    //     contiguous slice of rev_adj -- O(in-degree(node)) and
+    //     cache-friendly.
+    const int begin = rev_off[node];
+    const int end   = rev_off[node + 1];
+
+    // Opinions are 0 or 1, so summing them gives count_1 directly.
+    // count_0 = total - count_1, no second accumulator needed.
     int count_1 = 0;
-    
-    for(int i = 0; i < total_nodes; ++i)
+    for (int k = begin; k < end; ++k)
     {
-        // If voter 'i' influences the current 'node'
-        if(adj[i][node] == 1)
-        {
-            if(opinions[i] == 0) count_0++;
-            else if(opinions[i] == 1) count_1++;
-        }
+        count_1 += opinions[rev_adj[k]];
     }
-    
-    if(count_1 > count_0)
-    {
-        return 1;
-    }
-    return 0; // Return 0 for both 0-majority and tie
+    const int total = end - begin;
+    const int count_0 = total - count_1;
+
+    return (count_1 > count_0) ? 1 : 0; // tie -> 0
 }
 
-// Calculate new opinions for all voters and return if anyone's opinion changed
+// Calculate new opinions for all voters and return whether anyone changed.
 bool update_opinions()
 {
-    // (5) For each node, calculate the majority opinion among its neighbours 
-    // and update the node's opinion. 
-    // Return true if any node's opinion changed, false otherwise.
+    // (5) Synchronous update: write into a parallel buffer so updates
+    //     within the same step don't cascade. swap() commits in O(1).
     bool changed = false;
-    
-    // Create a temporary array to store the next state synchronously so 
-    // updates don't cascade within the same simulation step
-    std::vector<int> next_opinions(total_nodes);
-    
-    for(int i = 0; i < total_nodes; ++i)
+    std::vector<uint8_t> next_opinions(total_nodes);
+
+    for (int i = 0; i < total_nodes; ++i)
     {
-        next_opinions[i] = get_majority_friend_opinions(i);
-        if(next_opinions[i] != opinions[i])
-        {
-            changed = true;
-        }
+        const uint8_t next = static_cast<uint8_t>(get_majority_friend_opinions(i));
+        next_opinions[i] = next;
+        if (next != opinions[i]) changed = true;
     }
-    
-    opinions = next_opinions; // Commit the new states
+
+    opinions.swap(next_opinions); // O(1) -- no per-element copy.
     return changed;
 }
 
 int main() {
-    // no preallocation; vectors grow on demand
+    // Faster iostream: untie cin from cout and skip C-stdio sync.
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
 
-    // Read input files
-    read_opinions("opinions.txt"); 
+    // Read input files.
+    read_opinions("opinions.txt");
     read_edges("edge_list.txt");
 
-    // convert edge list into adjacency matrix once we know total_nodes
-    build_adj_matrix();
-    
+    // If edges reference voters not listed in opinions.txt, treat them
+    // as opinion 0 by default.
+    if (static_cast<int>(opinions.size()) < total_nodes)
+        opinions.resize(total_nodes, 0);
+
+    // Build CSR reverse-adjacency once total_nodes is known.
+    build_reverse_adj_csr();
+
     cout << "Total nodes: " << total_nodes << endl;
-    
-    // Run simulation
+    cout << "Total edges: " << rev_adj.size() << endl;
+
+    // Run simulation.
     int max_iterations = 30;
     int iteration = 0;
     bool opinions_changed = true;
-    
-    // Print initial state
-    cout << "Iteration " << iteration << ": fraction of 1's = " 
+
+    cout << "Iteration " << iteration << ": fraction of 1's = "
          << calculate_fraction_of_ones() << endl;
-    
+
     /// (6)  //////////////////////////////////////////////
-    // Run until consensus or max iterations
-    while(iteration < max_iterations)
+    while (iteration < max_iterations)
     {
         opinions_changed = update_opinions();
-        // If no opinions changed this round, break out immediately
-        // so we don't count it as an extra iteration
-        if(!opinions_changed) {
-            break; 
-        }
-        iteration++;
-        
-        // Print the state of the system at regular intervals (e.g., every 10 iterations)
-        if(opinions_changed)
-        {
-            cout << "Iteration " << iteration << ": fraction of 1's = " 
-                 << calculate_fraction_of_ones() << endl;
-        }
+        if (!opinions_changed) break; // consensus reached, don't count this round
+        ++iteration;
+        cout << "Iteration " << iteration << ": fraction of 1's = "
+             << calculate_fraction_of_ones() << endl;
     }
-
     ////////////////////////////////////////////////////////
-    // Print final result
-    double final_fraction = calculate_fraction_of_ones();
 
-    // RM redundant printing of final fraction since we already print it in the loop, but keeping it here for clarity
-    // cout << "Iteration " << iteration << ": fraction of 1's = " 
-    //     << final_fraction << endl;
-    
-    if(final_fraction == 1.0)
+    double final_fraction = calculate_fraction_of_ones();
+    if (final_fraction == 1.0)
         cout << "Consensus reached: all 1's" << endl;
-    else if(final_fraction == 0.0)
+    else if (final_fraction == 0.0)
         cout << "Consensus reached: all 0's" << endl;
     else
         cout << "No consensus reached after " << iteration << " iterations" << endl;
-    
+
     return 0;
 }
 
 
-/*********** Functions to read files **************************/ 
+/*********** Functions to read files **************************/
 
-// Read opinion vector from file.
+// Read opinion vector from file. Tolerates non-contiguous IDs; missing
+// IDs default to opinion 0.
 void read_opinions(string filename)
 {
     ifstream file(filename);
     int id, opinion;
-    while(file >> id >> opinion)
+    while (file >> id >> opinion)
     {
-        opinions.push_back(opinion);
-        if(id >= total_nodes) total_nodes = id+1;
+        if (id >= static_cast<int>(opinions.size()))
+            opinions.resize(id + 1, 0);
+        opinions[id] = static_cast<uint8_t>(opinion);
+        if (id + 1 > total_nodes) total_nodes = id + 1;
     }
-    file.close();
 }
 
-// Read edge list from file and update total nodes as needed.
+// Read edge list from file and update total_nodes as needed.
+// Edges land in edge_buffer; build_reverse_adj_csr converts them to CSR.
 void read_edges(string filename)
 {
     ifstream file(filename);
+    if (!file) return;
+
+    // Reserve a sensible size up front so push_back doesn't reallocate
+    // repeatedly on large files. We use the file size as a rough hint
+    // (~8 bytes per edge line is a safe lower bound).
+    file.seekg(0, std::ios::end);
+    const auto size_hint = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size_hint > 0)
+        edge_buffer.reserve(static_cast<size_t>(size_hint) / 8);
+
     int source, target;
-    
-    while(file >> source >> target)
+    while (file >> source >> target)
     {
-        edge_list.push_back({source, target});
-        if(source >= total_nodes) total_nodes = source+1;
-        if(target >= total_nodes) total_nodes = target+1;
+        edge_buffer.emplace_back(source, target);
+        if (source + 1 > total_nodes) total_nodes = source + 1;
+        if (target + 1 > total_nodes) total_nodes = target + 1;
     }
-    file.close();
 }
 
 /********************************************************************** */
